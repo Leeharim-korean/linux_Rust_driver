@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config HELLO_RUST
+	tristate "Hello Rust kernel module"
+	depends on RUST
+	help
+	  A minimal kernel module written in Rust.
+	  Designed for learning the module!{} macro and the kernel::Module trait.
+
+	  To compile this as a module, choose M here:
+	  the module will be called hello_rust.
+
+	  If unsure, say N.
