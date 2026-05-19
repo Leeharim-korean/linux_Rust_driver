@@ -129,26 +129,42 @@ dmesg | grep rust_cec | tail -5
 
 ## 실행 결과
 
-```
-[  190.869036] rust_cec: loading out-of-tree module taints kernel.
-[  190.870367] rust_cec: loaded (Phase 5 skeleton)
-[  190.870379] rust_cec: CecData initialized, completed=false
-
-[  200.196175] rust_cec: unloaded
-[  200.196193] rust_cec: CecData dropped — cancel guaranteed (no if-guard)
-```
-
-### Drop 호출 순서 확인
-
-`rmmod` 시 두 개의 Drop이 순서대로 호출된다:
+### 1차 insmod — Race Window 실증 (관찰)
 
 ```
-200.196175  RustCec::drop()   → pr_info!("unloaded")
-                               → _data(Arc<CecData>) 소멸 시작
-200.196193  CecData::drop()   → pr_info!("CecData dropped...")
+[ 1347.326516] rust_cec: init: enqueueing work (Arc clone → workqueue)
+[ 1347.326553] rust_cec: cec_wait_timeout: running (Arc<CecData> held)
+[ 1347.326587] rust_cec: init: transmit done, completed=true
+[ 1347.327286] rust_cec: cec_wait_timeout: done
+[ 1353.901466] rust_cec: RustCec::drop — _data Arc released, CecData freed if refcount→0
 ```
 
-`RustCec`가 소멸되면서 보유하던 `Arc<CecData>` 참조가 해제되고, 마지막 참조였으므로 즉시 `CecData::drop()`이 연쇄 호출된다. C에서 `if (!data->completed)` 조건으로 누락될 수 있었던 정리 로직이, Rust에서는 소유권 구조상 **반드시 실행**됨을 실증한다.
+**`init: transmit done`이 `cec_wait_timeout: done`보다 0.7ms 앞서 출력**되었다.
+
+이것이 CVE-2023-52846 Race Window의 실물 재현이다:
+
+```
+1347.326587  init: transmit done       ← notify_one() 후 init 스레드가 먼저 CPU 획득
+                                         C 취약 코드라면 이 시점에 kfree(data) 실행
+             ↑ ← 0.7ms Race Window → ↓   workqueue는 아직 실행 중
+1347.327286  cec_wait_timeout: done    ← workqueue 스레드가 뒤늦게 CPU 획득
+                                         Arc<CecData>를 이 시점까지 보유
+```
+
+Rust에서는 workqueue가 `Arc<CecData>`를 보유하므로 `RustCec::_data`가 소멸되어도 CecData 메모리 해제가 불가능하다. C의 `kfree(data)` Race는 구조적으로 차단된다.
+
+### 2차 insmod — 정상 흐름 (순차 완료)
+
+```
+[ 1391.626717] rust_cec: init: allocating CecData
+[ 1391.626740] rust_cec: init: enqueueing work (Arc clone → workqueue)
+[ 1391.626777] rust_cec: cec_wait_timeout: running (Arc<CecData> held)
+[ 1391.626810] rust_cec: cec_wait_timeout: done
+[ 1391.626825] rust_cec: init: transmit done, completed=true
+[ 1399.499371] rust_cec: RustCec::drop — _data Arc released, CecData freed if refcount→0
+```
+
+workqueue가 완료된 후 init이 반환되는 순차 케이스. 두 경우 모두 `RustCec::drop`은 rmmod 시점에 정상 호출된다.
 
 ---
 
@@ -158,16 +174,18 @@ dmesg | grep rust_cec | tail -5
 |------|------|------|
 | `Arc::try_new` 컴파일 오류 | 커널 `Arc` API는 `try_new` 미존재, `new(contents, flags)` 사용 | `Arc::new(Self { ... }, GFP_KERNEL)?` 로 수정 |
 | `AllocError` / `Error` 타입 불일치 | `Arc::new`는 `AllocError` 반환, 함수 반환 타입은 `kernel::Error` | `Ok(Arc::new(...)?)` — `?`로 타입 변환 후 `Ok` 래핑 |
+| `MustNotImplDrop` 충돌 | `#[pin_data]` 구조체에 `impl Drop` 동시 사용 불가 | `#[pin_data(PinnedDrop)]` + `#[pinned_drop]` 로 전환 시도했으나 외부 모듈에서 `$crate::__pin_data` 경로 문제 발생 → `Drop for CecData` 제거, `Arc` 참조 카운트 소멸로 대체 |
 | SSH sudo 비밀번호 프롬프트 불가 | `ssh` 비대화형 세션에서 `sudo` 실행 불가 | RPi 5에 직접 SSH 접속 후 수동 실행 |
 
 ---
 
-## 학습 내용
+## 내용
 
 - `AtomicBool` (`core::sync::atomic`): 커널 Rust에서 `std` 없이 `core`만으로 원자적 접근 가능. `Ordering::Release`/`Acquire` 쌍으로 happens-before 관계 형성
 - `Arc::new(contents, GFP_KERNEL)?`: 커널 Rust의 힙 할당은 항상 GFP 플래그를 명시하며, 할당 실패를 `Result`로 처리
-- `AllocError` → `kernel::Error` 변환: `?` 연산자가 `From<AllocError> for Error` 구현을 통해 자동 변환
-- `Drop` 연쇄: `Arc<T>` 소멸 시 참조 카운트가 0이 되면 `T::drop()`이 자동 호출 — 명시적 해제 코드 불필요
+- `Arc::pin_init`: `#[pin_data]` 구조체(CondVar, Mutex, Work 포함)는 이동 불가 — in-place 초기화를 위해 `Arc::pin_init` + `pin_init!` 매크로 사용
+- `CondVar` + `Mutex<bool>`: C의 `struct completion` / `complete()` / `wait_for_completion_killable()` 패턴을 Rust로 구현. `while !*guard` 루프로 스퓨리어스 웨이크업 방지
+- `WorkItem::run(this: Arc<Self>)`: workqueue 실행 중 `Arc` 참조가 살아있어 메모리 해제 불가 — 1차 insmod 로그에서 0.7ms Race Window 동안 UAF가 구조적으로 차단됨을 실물로 확인
 
 
 ---
@@ -188,3 +206,11 @@ dmesg | grep rust_cec | tail -5
 | `kernel::alloc::flags` (GFP_KERNEL) | 커널 소스 | `rust/kernel/alloc/flags.rs` |
 | Rust-for-Linux 드라이버 예제 | 커널 소스 | `samples/rust/` |
 | Phase 4 KASAN 실증 | 본 저장소 | `Documentation/driver-notes/phase-4-bug-injection.md` |
+
+rust: extend Phase 5 rust_cec with workqueue + CondVar full implementation
+
+- Add WorkItem for CecData: simulates cec_wait_timeout, holds Arc<CecData> during execution preventing kfree race
+- Add Mutex<bool> + CondVar: simulates wait_for_completion_killable
+- Verified on RPi 5: 1st insmod shows 0.7ms Race Window where workqueue was still running after init completed — Arc prevented UAF in this window
+- Troubleshoot: PinnedDrop incompatible with out-of-tree $crate path. resolved by relying on Arc refcount for CecData cleanup
+- Update phase-5 doc with full execution logs and Race Window analysis
