@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config RUST_CEC
+	tristate "Rust CEC driver (Phase 5 — safe wrapper)"
+	depends on RUST && CEC_CORE
+	help
+	  Rust reimplementation of the CEC transmit path.
+
+	  Demonstrates compile-time prevention of CVE-2023-52846 (UAF):
+	    - AtomicBool replaces plain bool completed
+	    - Arc<CecData> prevents kfree while workqueue holds a reference
+	    - Drop trait guarantees unconditional cancel (no if-guard)
+
+	  To compile as a module, choose M here: the module will be called rust_cec.
+
+	  If unsure, say N.
